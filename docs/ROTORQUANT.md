@@ -16,16 +16,18 @@ deployment-ready plan-of-record for a C++ engineer.
 4. [Run All Tests](#run-all-tests)
 5. [Reading Order](#reading-order)
 6. [Compression / Quality Summary](#compression--quality-summary)
-7. **[Phase 2 — QJL Stage 2 (Unbiased Inner Product Estimator)](#phase-2--qjl-stage-2-unbiased-inner-product-estimator)**
-8. **[Phase 3 — PlanarQuant (Block-Diagonal Givens Rotation)](#phase-3--planarquant-block-diagonal-givens-rotation)**
-9. **[Phase 4 — IsoQuant (Quaternion 4D Block Rotations)](#phase-4--isoquant-quaternion-4d-block-rotations)**
-10. **[Phase 5 — DeferredQuantCache (Post-Prefill Quantization)](#phase-5--deferredquantcache-post-prefill-quantization)**
-11. **[Phase 6 — Symmetric V Cache + the Inverse-Rotation Trap](#phase-6--symmetric-v-cache--the-inverse-rotation-trap)**
-12. **[Phase 7 — Triton Kernels (with PyTorch fallback)](#phase-7--triton-kernels-with-pytorch-fallback)**
-13. **[Phase 8 + 9 — Fused Quantize+Attention and GQA](#phase-8--9--fused-quantizeattention-and-gqa)**
-14. **[Phase 10 — RaBitQ (1-Bit Sign Packing)](#phase-10--rabitq-1-bit-sign-packing)**
-15. **[Phase 11 — llama.cpp Integration (Plan-of-Record)](#phase-11--llamacpp-integration-plan-of-record)**
-16. **[End-to-End Validation Details](#end-to-end-validation-details)**
+7. **[Problems Solved per Phase](#problems-solved-per-phase)**
+8. **[Which Configuration to Use for Which Model](#which-configuration-to-use-for-which-model)**
+9. **[Phase 2 — QJL Stage 2 (Unbiased Inner Product Estimator)](#phase-2--qjl-stage-2-unbiased-inner-product-estimator)**
+10. **[Phase 3 — PlanarQuant (Block-Diagonal Givens Rotation)](#phase-3--planarquant-block-diagonal-givens-rotation)**
+11. **[Phase 4 — IsoQuant (Quaternion 4D Block Rotations)](#phase-4--isoquant-quaternion-4d-block-rotations)**
+12. **[Phase 5 — DeferredQuantCache (Post-Prefill Quantization)](#phase-5--deferredquantcache-post-prefill-quantization)**
+13. **[Phase 6 — Symmetric V Cache + the Inverse-Rotation Trap](#phase-6--symmetric-v-cache--the-inverse-rotation-trap)**
+14. **[Phase 7 — Triton Kernels (with PyTorch fallback)](#phase-7--triton-kernels-with-pytorch-fallback)**
+15. **[Phase 8 + 9 — Fused Quantize+Attention and GQA](#phase-8--9--fused-quantizeattention-and-gqa)**
+16. **[Phase 10 — RaBitQ (1-Bit Sign Packing)](#phase-10--rabitq-1-bit-sign-packing)**
+17. **[Phase 11 — llama.cpp Integration (Plan-of-Record)](#phase-11--llamacpp-integration-plan-of-record)**
+18. **[End-to-End Validation Details](#end-to-end-validation-details)**
 
 ---
 
@@ -157,6 +159,93 @@ If you're new to this codebase, read sections in this order:
 Layered with Phase 5 (DeferredQuantCache) all of these maintain near-baseline
 PPL on real models — the compounding problem is solved at the cache layer,
 not at the quantizer layer.
+
+---
+
+## Problems Solved per Phase
+
+Each phase exists to fix a **specific failure mode** that the previous phases
+left open. Reading the column "without this phase" tells you what would go
+wrong if you skipped it.
+
+| # | Phase | Problem it solves | Without this phase | Empirical evidence |
+|---|---|---|---|---|
+| **1** | Norm separation | Lloyd-Max codebook is built for unit vectors; raw K/V have wildly varying norms (RoPE, layer norm). | Quantization indices clip to extremes; per-coordinate MSE 5–10× theoretical. | `verify_roundtrip.py`: 4-bit MSE within 0.1 % of theoretical (was off by ~5× before norm separation). |
+| **2** | QJL Stage 2 | MSE-only `<y, x_hat>` is a **biased** estimator of `<y, x>` — slope ≈ 0.97, attention scores systematically under-shoot. | Attention drifts (small but coherent bias accumulates over many cached keys). | `test_qjl_unbiased.py`: slope 0.9991 with QJL vs 0.9671 without. |
+| **3** | PlanarQuant | TurboQuant's `d × d` rotation costs 33,000 FMAs per dequant and 16K params; can't fit in GPU registers → no fused kernels possible. | Stuck with the slow PyTorch dequantize → matmul pipeline; no decode-speed win. | `test_planarquant.py`: 512 FMAs (64× less), 128 params (125× less), same MSE. Enables Phase 7/8. |
+| **4** | IsoQuant | PlanarQuant has only 1 DOF per pair; at 4-bit the rotation isn't expressive enough to extract maximum benefit from the larger codebook. | 4-bit PPL ~10.12 (PlanarQuant) instead of ~9.03 achievable. | `test_isoquant.py`: matches PlanarQuant MSE within 0.6 % at 4-bit; full mode 0.6 % MSE win. |
+| **5** | DeferredQuantCache | Quantizing K **during prefill** feeds noisy outputs into the next layer's input → **error compounds geometrically across 30+ layers** → PPL > 1000, gibberish output. | Catastrophic quality collapse on any real model. The plan calls this "the most important phase". | `test_deferred_cache.py`: 2.21× compounding penalty avoided in 12-layer toy model. End-to-end Qwen 3.5: coherent text. |
+| **6** | SymmetricKVCache | V dequant must explicitly apply the **inverse rotation** (V is consumed in original basis, unlike K which is dotted with rotated Q). Forward-rotation-in-V-dequant = silent failure, no exception. | Attention output cosine sim collapses from 0.99 → -0.02; PPL goes from 7 → 15 000+ with no error message. | `test_symmetric_cache.py`: construction-time `assert_inverse_correct` raises `RuntimeError` if a buggy quantizer is plugged in. |
+| **7** | Triton kernels | PyTorch dequant launches 4 separate kernels per K vector, each with a VRAM round-trip → memory-bound at 0.5 FLOPs/byte. | 100–650× slower than possible on GPU; the cache compression doesn't translate into decode speed. | `test_kernel_parity.py`: fused round-trip is bit-exact (5.6e-8 rel diff). On CUDA: 100–650× speedup (per the plan; not measurable on Apple). |
+| **8** | Fused quantize+attention | Even with Triton, the standard pipeline has the quantized K touching VRAM 4 times per decode step. | Decode bottlenecked by memory bandwidth, not arithmetic. | `test_fused_attention.py`: arithmetic intensity from 0.5 → 500 FLOPs/byte; the plan reports 1.1–4.5× faster than cuBLAS at seq_len=4K. |
+| **9** | GQA support | In Llama 3 / Qwen 2.5 / Mistral, multiple Q heads share one KV head (4–8× ratio). Naive code stores the same quantized indices per Q head → 4–8× redundant cache. | KV cache size scales with H_q instead of H_kv → wastes most of the compression. | `test_fused_attention.py`: `packed.shape[1] == H_kv` (2, not 8) for `H_q=8, H_kv=2`. |
+| **10** | RaBitQ (1-bit) | At 100K+ context for retrieval, even 3-bit (5×) compression isn't enough. Need a path to ~13× compression. | Stuck at 5–10× compression ceiling; can't fit 100K-context indices in RAM. | `test_rabitq.py`: 12.8× compression, slope 1.0077 with `π/2` correction (was 0.6415 without). |
+| **11** | llama.cpp integration | Python prototype is research-grade; production serving needs C++/CUDA in ggml. | Can't deploy with `llama.cpp`-based servers; can't run on edge devices via ggml. | Plan-of-record (835 LOC), not yet implemented. |
+
+### Two ways to read this table
+
+**By failure mode** (problem-first): "What goes wrong without …?" — this is
+the column that justifies every phase.
+
+**By dependency** (build order): each phase depends on the previous ones.
+Skip Phase 5 and the rest produces gibberish. Skip Phase 6 and symmetric
+configs silently break. Skip Phase 7 and decode speed never improves.
+
+---
+
+## Which Configuration to Use for Which Model
+
+The optimal config depends on three things:
+
+1. **Model architecture** — dense (all full-attention) vs hybrid (mix of
+   linear-attention + full-attention vs MoE). Only full-attention layers
+   are quantized; linear-attention state is independent.
+2. **Bit budget** — 3-bit, 4-bit, or 1-bit. 4-bit packs cleanly into bytes
+   (efficient storage); 3-bit doesn't (this codebase uses byte-per-index
+   for non-power-of-2 widths).
+3. **Use case** — generation (need quality), retrieval (need recall@k),
+   long-context (memory-dominant).
+
+### Decision matrix
+
+| Model family | Architecture | Recommended config | Module to use | Why |
+|---|---|---|---|---|
+| **Llama 3.x (8B, 70B)** | Dense, GQA | `iso4 / iso4` | `SymmetricKVCache(IsoQuant(d, 4), IsoQuant(d, 4))` | 4-bit packs cleanly → ~4× compression on entire cache; quaternion 4-block rotation has the headroom for low PPL. Phase 9 GQA fix is essential here. |
+| **Qwen 2.5 dense (3B, 7B, 14B)** | Dense, GQA | `iso4 / iso4` | `SymmetricKVCache(IsoQuant(d, 4), IsoQuant(d, 4))` | Same reasoning as Llama 3. The plan reports `iso3/iso3` as production default in llama.cpp; if 3-bit packing is added, switch to that. |
+| **Qwen 3.5-0.8B** (this repo's example) | Hybrid (18 linear + 6 full) | `iso4 / iso4` | `enable_rotorquant(model, 4, 4, "iso")` | Empirically validated: 6.95× compression on full-attn KV, +10.5 % throughput vs FP32. PlanarQuant K=3/V=3 has worse storage here due to byte-per-index 3-bit. |
+| **Mistral 7B / Mixtral 8×7B** | Dense, GQA, sliding window | `planar3 / planar3` | `SymmetricKVCache(PlanarQuant(d, 3), PlanarQuant(d, 3))` | Sliding window already caps cache size; further compression is bonus. PlanarQuant's lower per-vector compute helps with frequent quantize/dequantize. **Note:** 3-bit storage is only beneficial if true 3-bit packing is wired up. |
+| **Llama 1 / 2 (7B, 13B)** | Dense, no GQA | `iso4 / f16` (asymmetric) | `DeferredQuantCache(IsoQuant(d, 4), None)` | No GQA → quantizing V doesn't save much vs the kernel complexity. K-only at 4-bit gives ~2× compression at near-zero quality cost. |
+| **Phi-3 mini (3.8B)** | Dense, GQA, 128K context | `iso4 / iso4` | `SymmetricKVCache(IsoQuant(d, 4), IsoQuant(d, 4))` | Long-context model — every byte saved matters at 128K. |
+| **Embedding / retrieval models (BGE, E5)** | Encoder-only | `RaBitQ(d, "full")` | `RaBitQ(dim, rotation="full")` | Top-k retrieval doesn't need readable outputs. 12.8× compression is the killer feature; full random rotation only — Planar/Iso fail at 1-bit. |
+| **Reranker over a 100K-vec index** | Any | `RaBitQ(d, "full")` for keys, full-precision query | Same as above + `estimate_inner_product_asymmetric` | Asymmetric IP: query stays FP, keys are 1-bit. The `π/2` correction makes the score unbiased. |
+| **Tiny models (≤1B), CPU inference** | Dense | FP16 (no quantization) | n/a | Quantization overhead dominates for small KV; not worth it. |
+| **CUDA serving with FlashAttention** | Any modern model | Phases 7+8 fused kernel | `kernels/fused_planar_attn.py` | The 1.1–4.5× decode speedup needs a real GPU. PyTorch fallback works but doesn't show the win. |
+| **Production llama.cpp deployment** | Any | `iso3 / iso3` | Phase 11 plan + C++ port | Plan reports 118 tok/s on RTX 5090, Llama 3.1 8B, PPL 6.91. |
+
+### Quick chooser by use case
+
+```
+Need maximum quality?                   → iso4 / iso4 (or fp16 if compute is cheap)
+Need maximum compression for retrieval? → RaBitQ with rotation="full"
+Need both speed AND compression on GPU? → planar3/planar3 + Phase 7/8 Triton kernels
+On Apple Silicon (no Triton)?           → iso4 / iso4 (best on-disk, MPS-friendly)
+Hybrid / linear-attn model?             → Same as dense, but expect smaller relative wins
+Older non-GQA model (Llama 1, 2 7B)?    → iso4 K-only (V stays FP16)
+Long-context (>32K)?                    → iso3/iso3 if quality OK, else iso4/iso4
+1-bit (extreme compression, retrieval)? → RaBitQ with rotation="full" (NEVER planar/iso at 1-bit)
+```
+
+### What NOT to do (anti-patterns)
+
+| Don't | Why |
+|---|---|
+| Use **PlanarQuant or IsoQuant rotation at 1-bit** | Inter-group correlations leak through; PPL > 600 vs 107 for `'full'`. |
+| Use **PlanarQuant K=3/V=3 in this codebase** as a memory-saver | Non-power-of-2 packing falls back to byte-per-index → 8 bits/coord storage. Use IsoQuant K=4/V=4 (4 bits/coord) instead until true 3-bit packing is added. |
+| Use **`DeferredQuantCache` without `quantizer_v=None`** for K-only mode | Wastes V-side bytes on a quantizer that's never invoked; pass `None` explicitly. |
+| Use **`SymmetricKVCache(qk, qv, check_inverse=False)`** in development | The 30 ms init check is the only line standing between you and a multi-hour PPL debug session if a future quantizer has a wrong inverse. |
+| Use **TurboQuant with the fused attention kernel** | TurboQuant's `d × d` matmul doesn't fit in GPU registers; Phase 8 is impossible for it. PlanarQuant or IsoQuant only. |
+| Quantize **K_new at the current decode step before passing to attention** | Reintroduces compounding for the latest token. `DeferredQuantCache.append_decode` returns FP16 K_new in the result — keep that invariant. |
+| Skip **Phase 5** "for simplicity" | This is the catastrophic-failure switch. Without post-prefill, every other phase still gives PPL > 1000. Non-negotiable. |
 
 ---
 ---
